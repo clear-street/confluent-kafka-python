@@ -1,6 +1,7 @@
 #!/usr/bin/env python
+# -*- coding: utf-8 -*-
 #
-# Copyright 2016 Confluent Inc.
+# Copyright 2020 Confluent Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,35 +17,17 @@
 #
 
 
-#
-# derived from https://github.com/verisign/python-confluent-schemaregistry.git
-#
 import io
 import logging
 import struct
-import sys
-import traceback
+import warnings
 
-import avro
-import avro.io
+from fastavro import schemaless_writer, schemaless_reader
 
-from confluent_kafka.avro import ClientError
-from confluent_kafka.avro.serializer import (SerializerError,
-                                             KeySerializerError,
-                                             ValueSerializerError)
+from confluent_kafka.avro.serializer import SerializerError, ValueSerializerError, KeySerializerError
 
 log = logging.getLogger(__name__)
-
 MAGIC_BYTE = 0
-
-HAS_FAST = False
-try:
-    from fastavro import schemaless_reader, schemaless_writer
-    from fastavro.schema import parse_schema
-
-    HAS_FAST = True
-except ImportError:
-    pass
 
 
 class ContextStringIO(io.BytesIO):
@@ -66,167 +49,244 @@ class MessageSerializer(object):
     that need to be encoded or decoded using the schema registry.
 
     All encode_* methods return a buffer that can be sent to kafka.
-    All decode_* methods expect a buffer received from kafka.
+    All decode_* methods accept a buffer received from kafka.
     """
 
+    # TODO: Deprecate reader_[key|value]_schema args move into Schema object
     def __init__(self, registry_client, reader_key_schema=None, reader_value_schema=None):
         self.registry_client = registry_client
-        self.id_to_decoder_func = {}
-        self.id_to_writers = {}
         self.reader_key_schema = reader_key_schema
         self.reader_value_schema = reader_value_schema
+        warnings.warn(
+            "MessageSerializer is being deprecated and will be removed in a future release."
+            "Use AvroSerializer instead. ",
+            category=DeprecationWarning, stacklevel=2)
 
-    # Encoder support
-    def _get_encoder_func(self, writer_schema):
-        if HAS_FAST:
-            schema = writer_schema.to_json()
-            parsed_schema = parse_schema(schema)
-            return lambda record, fp: schemaless_writer(fp, parsed_schema, record)
-        writer = avro.io.DatumWriter(writer_schema)
-        return lambda record, fp: writer.write(record, avro.io.BinaryEncoder(fp))
-
+    # TODO: Deprecate, rename serialize()
     def encode_record_with_schema(self, topic, schema, record, is_key=False):
         """
-        Given a parsed avro schema, encode a record for the given topic.  The
+        Given a parsed Schema, encode a record for the given topic.  The
         record is expected to be a dictionary.
-
         The schema is registered with the subject of 'topic-value'
+
         :param str topic: Topic name
-        :param schema schema: Avro Schema
-        :param dict record: An object to serialize
+        :param Schema schema: Parsed schema
+        :param object record: An object to serialize
         :param bool is_key: If the record is a key
         :returns: Encoded record with schema ID as bytes
         :rtype: bytes
         """
-        serialize_err = KeySerializerError if is_key else ValueSerializerError
 
         subject_suffix = ('-key' if is_key else '-value')
-        # get the latest schema for the subject
         subject = topic + subject_suffix
-        if self.registry_client.auto_register_schemas:
-            # register it
-            schema_id = self.registry_client.register(subject, schema)
-        else:
-            schema_id = self.registry_client.check_registration(subject, schema)
-        if not schema_id:
-            message = "Unable to retrieve schema id for subject %s" % (subject)
-            raise serialize_err(message)
 
-        # cache writer
-        self.id_to_writers[schema_id] = self._get_encoder_func(schema)
+        self.registry_client.register(subject, schema)
 
-        return self.encode_record_with_schema_id(schema_id, record, is_key=is_key)
-
-    def encode_record_with_schema_id(self, schema_id, record, is_key=False):
-        """
-        Encode a record with a given schema id.  The record must
-        be a python dictionary.
-        :param int schema_id: integer ID
-        :param dict record: An object to serialize
-        :param bool is_key: If the record is a key
-        :returns: decoder function
-        :rtype: func
-        """
-        serialize_err = KeySerializerError if is_key else ValueSerializerError
-
-        # use slow avro
-        if schema_id not in self.id_to_writers:
-            # get the writer + schema
-
-            try:
-                schema = self.registry_client.get_by_id(schema_id)
-                if not schema:
-                    raise serialize_err("Schema does not exist")
-                self.id_to_writers[schema_id] = self._get_encoder_func(schema)
-            except ClientError:
-                exc_type, exc_value, exc_traceback = sys.exc_info()
-                raise serialize_err(repr(traceback.format_exception(exc_type, exc_value, exc_traceback)))
-
-        # get the writer
-        writer = self.id_to_writers[schema_id]
         with ContextStringIO() as outf:
             # Write the magic byte and schema ID in network byte order (big endian)
-            outf.write(struct.pack('>bI', MAGIC_BYTE, schema_id))
+            outf.write(struct.pack('>bI', MAGIC_BYTE, schema.id))
 
             # write the record to the rest of the buffer
-            writer(record, outf)
+            schemaless_writer(outf, schema.schema, record)
 
             return outf.getvalue()
 
-    # Decoder support
-    def _get_decoder_func(self, schema_id, payload, is_key=False):
-        if schema_id in self.id_to_decoder_func:
-            return self.id_to_decoder_func[schema_id]
+    def _deserialize(self, schema_id, data, is_key=False):
+        """
+        Deserializes bytes.
 
-        # fetch writer schema from schema reg
-        try:
-            writer_schema_obj = self.registry_client.get_by_id(schema_id)
-        except ClientError as e:
-            raise SerializerError("unable to fetch schema with id %d: %s" % (schema_id, str(e)))
+        :param int schema_id: Schema Registry Id
+        :param BytesIO data: bytes to be decoded
+        :param bool is_key: True if Message Key
+        :returns: Decoded value
+        :rtype: object
+        """
 
-        if writer_schema_obj is None:
-            raise SerializerError("unable to fetch schema with id %d" % (schema_id))
+        schema = self.registry_client.get_by_id(schema_id)
+        reader_schema = self.reader_key_schema if is_key else self.reader_value_schema
 
-        curr_pos = payload.tell()
+        if reader_schema:
+            return schemaless_reader(data, schema.schema, reader_schema.schema)
+        return schemaless_reader(data, schema.schema)
 
-        reader_schema_obj = self.reader_key_schema if is_key else self.reader_value_schema
-
-        if HAS_FAST:
-            # try to use fast avro
-            try:
-                fast_avro_writer_schema = parse_schema(writer_schema_obj.to_json())
-                fast_avro_reader_schema = parse_schema(reader_schema_obj.to_json())
-                schemaless_reader(payload, fast_avro_writer_schema)
-
-                # If we reach this point, this means we have fastavro and it can
-                # do this deserialization. Rewind since this method just determines
-                # the reader function and we need to deserialize again along the
-                # normal path.
-                payload.seek(curr_pos)
-
-                self.id_to_decoder_func[schema_id] = lambda p: schemaless_reader(
-                    p, fast_avro_writer_schema, fast_avro_reader_schema)
-                return self.id_to_decoder_func[schema_id]
-            except Exception:
-                # Fast avro failed, fall thru to standard avro below.
-                pass
-
-        # here means we should just delegate to slow avro
-        # rewind
-        payload.seek(curr_pos)
-        # Avro DatumReader py2/py3 inconsistency, hence no param keywords
-        # should be revisited later
-        # https://github.com/apache/avro/blob/master/lang/py3/avro/io.py#L459
-        # https://github.com/apache/avro/blob/master/lang/py/src/avro/io.py#L423
-        # def __init__(self, writers_schema=None, readers_schema=None)
-        # def __init__(self, writer_schema=None, reader_schema=None)
-        avro_reader = avro.io.DatumReader(writer_schema_obj, reader_schema_obj)
-
-        def decoder(p):
-            bin_decoder = avro.io.BinaryDecoder(p)
-            return avro_reader.read(bin_decoder)
-
-        self.id_to_decoder_func[schema_id] = decoder
-        return self.id_to_decoder_func[schema_id]
-
-    def decode_message(self, message, is_key=False):
+    def decode_message(self, data, is_key=False):
         """
         Decode a message from kafka that has been encoded for use with
         the schema registry.
-        :param str|bytes or None message: message key or value to be decoded
-        :returns: Decoded message contents.
-        :rtype dict:
+
+        :param str|bytes or None data: message key or value to be decoded
+        :param bool is_key: True if data is Message Key
+        :returns: Decoded value.
+        :rtype object:
         """
 
-        if message is None:
+        if data is None:
             return None
 
-        if len(message) <= 5:
+        if len(data) <= 5:
             raise SerializerError("message is too small to decode")
 
-        with ContextStringIO(message) as payload:
+        with ContextStringIO(data) as payload:
             magic, schema_id = struct.unpack('>bI', payload.read(5))
             if magic != MAGIC_BYTE:
                 raise SerializerError("message does not start with magic byte")
-            decoder_func = self._get_decoder_func(schema_id, payload, is_key)
-            return decoder_func(payload)
+
+            return self._deserialize(schema_id, payload, is_key)
+
+
+class MessageField(object):
+    KEY = 0
+    VALUE = 1
+
+
+def topic_name_strategy(field=MessageField.VALUE):
+    """
+
+
+    :param int field: Either key or Value
+    :returns: Filed specific topic name strategy function
+    :rtype: callable(str, Schema)
+    """
+    if field is MessageField.VALUE:
+        return topic_value_name_strategy
+    return topic_key_name_strategy
+
+
+def topic_key_name_strategy(topic, schema):
+    """
+        Returns a subject name in the form of {topic}-key
+
+        See the Confluent docs for additional information.
+        https://docs.confluent.io/current/schema-registry/serializer-formatter.html#how-the-naming-strategies-work
+
+        :param str topic: Topic name
+        :param Schema schema: Not used
+        :returns: subject name
+        :rtype: str
+        """
+
+    return topic + "-key"
+
+
+def topic_value_name_strategy(topic, schema):
+    """
+    Returns a subject name in the form of {topic}-value
+
+    See the Confluent docs for additional information.
+    https://docs.confluent.io/current/schema-registry/serializer-formatter.html#how-the-naming-strategies-work
+
+    :param str topic: Topic name
+    :param Schema schema: Not used
+    :returns: subject name
+    :rtype: str
+    """
+
+    return topic + "-value"
+
+
+def record_name_strategy(topic, schema):
+    """
+    Returns a subject name in the form of {schema name}
+
+    See the Confluent docs for additional information.
+    https://docs.confluent.io/current/schema-registry/serializer-formatter.html#how-the-naming-strategies-work
+
+    :param str topic: Not used
+    :param Schema schema: datum schema
+    :returns: Subject name
+    :rtype: str
+    """
+    return schema.name
+
+
+def topic_record_name_strategy(topic, schema):
+    """
+    Returns a subject name in the form of {topic}-{schema name}
+
+    See the Confluent docs for additional information.
+    https://docs.confluent.io/current/schema-registry/serializer-formatter.html#how-the-naming-strategies-work
+
+    :param str topic: Topic name
+    :param Schema schema: datum schema
+    :returns: Subject name
+    :rtype: str
+    """
+
+    return topic + "-" + schema.name
+
+
+class AvroSerializer(object):
+    __slots__ = ['registry_client', 'namer', 'error', '_schema', '_hash']
+
+    def __init__(self, registry_client, schema=None, name_strategy=None, field=MessageField.VALUE):
+        self.registry_client = registry_client
+        self.error = KeySerializerError if field == MessageField.KEY else ValueSerializerError
+        self._schema = schema
+
+        if name_strategy is None:
+            name_strategy = topic_name_strategy(field)
+
+        self.namer = name_strategy
+
+    def __hash__(self):
+        return hash(self._schema)
+
+    def encode(self, topic, datum):
+        """
+        Given a parsed Schema, encode a record for the given topic.  The
+        record is expected to be a dictionary.
+        The schema is registered with the subject of 'topic-value'
+
+        :param str topic: Topic name
+        :param Schema schema: Parsed Schema
+        :param AvroDatum datum: An object to serialize
+        :returns: Encoded record with schema ID as bytes
+        :rtype: bytes
+
+        :raises: SerializerError
+        """
+
+        if datum.data is None:
+            return
+
+        schema = datum.schema
+        datum = datum.data
+
+        subject = self.namer(topic, schema)
+        self.registry_client.register(subject, schema)
+
+        with ContextStringIO() as outf:
+            # Write the magic byte and schema ID in network byte order (big endian)
+            outf.write(struct.pack('>bI', MAGIC_BYTE, schema.id))
+
+            # write the record to the rest of the buffer
+            schemaless_writer(outf, schema.schema, datum)
+
+            return outf.getvalue()
+
+    def decode(self, data, reader_schema=None):
+        """
+        Decode a message from kafka that has been encoded for use with
+        the schema registry.
+
+        :param str|bytes or None data: message key or value to be decoded
+        :param Schema reader_schema: Optional compatible Schema to project value on.
+        :returns: Decoded value.
+        :rtype object:
+        """
+
+        if data is None:
+            return None
+
+        if len(data) <= 5:
+            raise self.error("message is too small to decode")
+
+        with ContextStringIO(data) as payload:
+            magic, schema_id = struct.unpack('>bI', payload.read(5))
+            if magic != MAGIC_BYTE:
+                raise self.error("message does not start with magic byte")
+
+            schema = self.registry_client.get_by_id(schema_id)
+            if reader_schema:
+                return schemaless_reader(payload, schema.schema, reader_schema.schema)
+            return schemaless_reader(payload, schema.schema)

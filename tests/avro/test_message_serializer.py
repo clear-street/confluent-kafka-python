@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Copyright 2016 Confluent Inc.
+# Copyright 2020 Confluent Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,10 +15,6 @@
 # limitations under the License.
 #
 
-
-#
-# derived from https://github.com/verisign/python-confluent-schemaregistry.git
-#
 
 import struct
 
@@ -46,34 +42,13 @@ class TestMessageSerializer(unittest.TestCase):
         self.assertTrue(decoded)
         self.assertEqual(decoded, expected)
 
-    def test_encode_with_schema_id(self):
-        adv = avro.loads(data_gen.ADVANCED_SCHEMA)
-        basic = avro.loads(data_gen.BASIC_SCHEMA)
-        subject = 'test'
-        schema_id = self.client.register(subject, basic)
-
-        records = data_gen.BASIC_ITEMS
-        for record in records:
-            message = self.ms.encode_record_with_schema_id(schema_id, record)
-            self.assertMessageIsSame(message, record, schema_id)
-
-        subject = 'test_adv'
-        adv_schema_id = self.client.register(subject, adv)
-        self.assertNotEqual(adv_schema_id, schema_id)
-        records = data_gen.ADVANCED_ITEMS
-        for record in records:
-            message = self.ms.encode_record_with_schema_id(adv_schema_id, record)
-            self.assertMessageIsSame(message, record, adv_schema_id)
-
     def test_encode_record_with_schema(self):
         topic = 'test'
         basic = avro.loads(data_gen.BASIC_SCHEMA)
-        subject = 'test-value'
-        schema_id = self.client.register(subject, basic)
         records = data_gen.BASIC_ITEMS
         for record in records:
             message = self.ms.encode_record_with_schema(topic, basic, record)
-            self.assertMessageIsSame(message, record, schema_id)
+            self.assertMessageIsSame(message, record, basic.id)
 
     def test_decode_none(self):
         """"null/None messages should decode to None"""

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Copyright 2016 Confluent Inc.
+# Copyright 2020 Confluent Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,10 +15,6 @@
 # limitations under the License.
 #
 
-
-#
-# derived from https://github.com/verisign/python-confluent-schemaregistry.git
-#
 
 import unittest
 
