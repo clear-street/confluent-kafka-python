@@ -209,6 +209,18 @@ class MessageSerializer(object):
         self.id_to_decoder_func[schema_id] = decoder
         return self.id_to_decoder_func[schema_id]
 
+    def _load_schema(self, schema_id):
+        # fetch from schema reg
+        try:
+            schema = self.registry_client.get_by_id(schema_id)
+        except ClientError as e:
+            raise SerializerError("unable to fetch schema with id %d: %s" % (schema_id, str(e)))
+
+        if schema is None:
+            raise SerializerError("unable to fetch schema with id %d" % (schema_id))
+
+        return schema
+
     def decode_message(self, message, is_key=False):
         """
         Decode a message from kafka that has been encoded for use with
@@ -228,5 +240,6 @@ class MessageSerializer(object):
             magic, schema_id = struct.unpack('>bI', payload.read(5))
             if magic != MAGIC_BYTE:
                 raise SerializerError("message does not start with magic byte")
+            schema = self._load_schema(schema_id)
             decoder_func = self._get_decoder_func(schema_id, payload, is_key)
-            return decoder_func(payload)
+            return decoder_func(payload), schema
